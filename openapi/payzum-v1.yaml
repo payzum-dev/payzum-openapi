@@ -1,0 +1,1381 @@
+# Payzum public API — OpenAPI 3.1 specification.
+#
+# SINGLE SOURCE OF TRUTH for the merchant-facing HTTP contract served by
+# workers/payzum/gateway (prod: api.payzum.com / merchant.payzum.com,
+# sandbox: staging.payzum.com). Generated from the 2026-08-28 API contract
+# audit: every path, parameter, field name and JSON type below was extracted
+# from the handler code (not from prose docs) and is enforced by the contract
+# test suite in tests/contract/.
+#
+# Out of scope (documented elsewhere, intentionally not in this spec):
+#   - POST /legacy/api.php     — CoinPayments form dialect (docs/adapters/*)
+#   - /v1/x402/{merchantId}/{slug} — dynamic x402 paywall proxy (docs/agents/*)
+#   - /v1/admin/*              — internal operator/ops tooling
+#   - /webhooks/vexo*          — inbound provider callbacks (not merchant-facing)
+#
+# Conventions (deliberate, per-surface — see docs/reference/errors):
+#   - Payments surface (/v1/payment*, /v1/estimate…): snake_case fields,
+#     NowPayments-compatible; monetary fields are JSON numbers (frozen for
+#     compatibility with the 21 production cart plugins).
+#   - Buyer surface (/v1/invoices/:id/status): camelCase, decimal STRINGS,
+#     epoch-ms timestamps, raw DB status vocabulary.
+#   - Payout surfaces (/v1/mass-payout*, /v1/evm-mass-payout*, /v1/nc-payout*):
+#     camelCase, `*Raw` integer strings in smallest units, Result envelope
+#     { ok, ... } with error kinds.
+#   - Export surface (/v1/export/*): snake_case, decimal strings.
+openapi: 3.1.0
+info:
+  title: Payzum API
+  version: "1.0.0"
+  description: >
+    Crypto payment gateway API. `/v1` is a stable surface: changes are
+    additive-only; breaking changes ship under `/v2` with a minimum 6-month
+    deprecation window.
+  contact:
+    url: https://merchant.payzum.com/docs
+servers:
+  - url: https://merchant.payzum.com
+    description: Production
+  - url: https://staging.payzum.com
+    description: Sandbox / staging (isolated data, per-environment API keys)
+  # NOTE: api.payzum.com appears in older prose docs but its DNS points
+  # outside Cloudflare and does not serve this API (verified 2026-08-28).
+  # Do not target it from SDKs until its routing is fixed and this entry
+  # is restored.
+
+security: []
+
+tags:
+  - name: public
+    description: No authentication.
+  - name: payments
+    description: NowPayments-compatible invoice API. Auth `x-api-key`.
+  - name: buyer
+    description: Buyer-facing polling. The invoice id is the bearer token.
+  - name: mass-payout-utxo
+    description: UTXO mass payouts (BTC/LTC/DOGE). Auth `x-api-key`.
+  - name: mass-payout-evm
+    description: EVM mass payouts. Auth `x-api-key`.
+  - name: nc-payout
+    description: Non-custodial EVM payouts (EIP-712 signed). Auth `x-api-key`.
+  - name: export
+    description: Accounting export + frozen monthly reports. Dual auth.
+  - name: x402
+    description: Agent-facing x402 discovery.
+  - name: operator
+    description: Operator-only (X-Operator-Key). Internal ops tooling.
+
+paths:
+  /health:
+    get:
+      tags: [public]
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service, status, timestamp]
+                properties:
+                  service: { type: string, const: payzum-gateway }
+                  status: { type: string, const: ok }
+                  timestamp: { type: string, format: date-time }
+
+  /v1/status:
+    get:
+      tags: [public]
+      summary: API status
+      operationId: getStatus
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string, const: OK }
+
+  /v1/currencies:
+    get:
+      tags: [public]
+      summary: Supported currencies
+      description: >
+        `currencies` is the historical flat array of NowPayments-style codes.
+        Native coins carry no network suffix, so the same code appears once
+        per chain ("eth" → ethereum/arbitrum/optimism/base). New integrations
+        should use `currencies_detailed`, which disambiguates every entry.
+        Query at runtime — never hardcode the list.
+      operationId: getCurrencies
+      responses:
+        "200":
+          description: Currency list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currencies, currencies_detailed]
+                properties:
+                  currencies:
+                    type: array
+                    items: { type: string }
+                  currencies_detailed:
+                    type: array
+                    items:
+                      type: object
+                      required: [code, symbol, chain, standard, contract_address, decimals, min_amount_usd]
+                      properties:
+                        code: { type: string }
+                        symbol: { type: string }
+                        chain: { type: string }
+                        standard: { type: string, enum: [native, erc20, spl, trc20] }
+                        contract_address: { type: [string, "null"] }
+                        decimals: { type: integer }
+                        min_amount_usd: { type: number }
+
+  /v1/estimate:
+    get:
+      tags: [public]
+      summary: Fiat → crypto estimate
+      operationId: getEstimate
+      parameters:
+        - { name: amount, in: query, required: true, schema: { type: string }, description: Positive number }
+        - { name: currency_from, in: query, required: true, schema: { type: string }, example: usd }
+        - { name: currency_to, in: query, required: true, schema: { type: string }, example: usdttrc20 }
+      responses:
+        "200":
+          description: Estimate
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currency_from, amount_from, currency_to, estimated_amount, min_amount_usd, below_minimum]
+                properties:
+                  currency_from: { type: string }
+                  amount_from: { type: number }
+                  currency_to: { type: string }
+                  estimated_amount:
+                    type: string
+                    description: Decimal string, up to 8 decimals. Not a binding quote.
+                    pattern: "^\\d+\\.\\d{2,8}$"
+                  min_amount_usd: { type: number }
+                  below_minimum:
+                    type: [boolean, "null"]
+                    description: Boolean only when currency_from=usd, otherwise null.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/RateProviderDown" }
+
+  /v1/min-amount:
+    get:
+      tags: [public]
+      summary: Minimum payment for a currency
+      operationId: getMinAmount
+      parameters:
+        - { name: currency_from, in: query, required: false, schema: { type: string, default: usd }, description: Cosmetic echo only — the computation is always USD-based. }
+        - { name: currency_to, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Minimum
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currency_from, currency_to, min_amount, min_amount_usd]
+                properties:
+                  currency_from: { type: string }
+                  currency_to: { type: string }
+                  min_amount: { type: number, description: "≤ 8 decimals" }
+                  min_amount_usd: { type: number }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/RateProviderDown" }
+
+  /v1/invoices/{paymentId}/status:
+    get:
+      tags: [buyer]
+      summary: Buyer-facing invoice status (public)
+      description: >
+        The invoice id (CUID2, ~120 bits entropy) is the bearer token.
+        Rate-limited 60/min per client IP — separate from the merchant budget.
+        This surface uses the buyer status vocabulary
+        (pending|partial|paid|overpaid|expired|cancelled), camelCase names,
+        decimal-string amounts and epoch-milliseconds timestamps.
+      operationId: getInvoiceStatusPublic
+      parameters:
+        - name: paymentId
+          in: path
+          required: true
+          schema: { type: string, pattern: "^pzi_[a-z0-9]{24,32}$" }
+      responses:
+        "200":
+          description: Invoice status
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status, payAddress, payAmount, payCurrency, payChain,
+                           priceAmount, priceCurrency, amountReceived, amountRemaining,
+                           expiresAt, paidAt, createdAt, timeRemainingSeconds]
+                properties:
+                  id: { type: string }
+                  status:
+                    type: string
+                    enum: [pending, partial, paid, overpaid, expired, cancelled]
+                  payAddress: { type: string }
+                  payAmount: { type: string, description: Decimal string (exact) }
+                  payCurrency: { type: string, description: Raw symbol, e.g. USDT }
+                  payChain: { type: string }
+                  priceAmount: { type: string }
+                  priceCurrency: { type: string, description: Uppercase }
+                  amountReceived: { type: string }
+                  amountRemaining: { type: string }
+                  expiresAt: { type: number, description: Epoch milliseconds }
+                  paidAt: { type: [number, "null"], description: Epoch milliseconds }
+                  createdAt: { type: number, description: Epoch milliseconds }
+                  timeRemainingSeconds: { type: number }
+        "400":
+          description: Malformed invoice id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicError" }
+        "404":
+          description: Unknown invoice
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicError" }
+        "429":
+          description: Per-IP rate limit exceeded
+          headers:
+            Retry-After: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicError" }
+
+  /v1/payment:
+    post:
+      tags: [payments]
+      summary: Create payment (invoice)
+      description: >
+        Optional `Idempotency-Key` header (1-255 chars): a repeat within 24h
+        replays the original 201 response with `X-Payzum-Idempotent-Replay: true`.
+        Best-effort (eventual consistency ~60s) — also dedupe on order_id for a
+        hard guarantee. `order_id` uniqueness is NOT enforced server-side.
+      operationId: createPayment
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 255 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [price_amount, price_currency, pay_currency]
+              properties:
+                price_amount: { type: number, exclusiveMinimum: 0 }
+                price_currency: { type: string, minLength: 2, maxLength: 8 }
+                pay_currency:
+                  type: string
+                  minLength: 2
+                  maxLength: 32
+                  description: >
+                    NP code (usdttrc20), bare symbol combined with `network`,
+                    or the literal "all" (buyer picks later; incompatible with
+                    pricing_mode=direct).
+                network: { type: string, description: When present, pay_currency is treated as a bare symbol. }
+                order_id: { type: string, maxLength: 255 }
+                order_description: { type: string, maxLength: 2000 }
+                ipn_callback_url: { type: string, format: uri }
+                purchase_id: { type: string, description: Accepted but ignored; response always echoes payment_id. }
+                success_url: { type: string, format: uri, maxLength: 2048 }
+                cancel_url: { type: string, format: uri, maxLength: 2048 }
+                pricing_mode:
+                  type: string
+                  enum: [fiat, direct]
+                  default: fiat
+      responses:
+        "201":
+          description: Created invoice (or draft when pay_currency="all")
+          headers:
+            X-Payzum-Idempotent-Replay:
+              schema: { type: string, const: "true" }
+              description: Present only when this response is an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NpPayment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Suspended" }
+        "422":
+          description: pay_currency="all" with zero eligible currencies
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NpError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/RateProviderDown" }
+    get:
+      tags: [payments]
+      summary: List payments
+      description: >
+        Unresolved pay_currency="all" drafts are NOT listed (they remain
+        retrievable via GET /v1/payment/{id}).
+      operationId: listPayments
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 10, minimum: 1, maximum: 100 } }
+        - { name: page, in: query, schema: { type: integer, default: 0, minimum: 0 }, description: Zero-based. }
+        - { name: sortBy, in: query, schema: { type: string, enum: [created_at, updated_at], default: created_at }, description: Any other value silently falls back to created_at. }
+        - { name: orderBy, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+      responses:
+        "200":
+          description: Page of payments
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, limit, page, pagesCount, total]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/NpPayment" }
+                  limit: { type: integer }
+                  page: { type: integer }
+                  pagesCount: { type: integer, minimum: 1 }
+                  total: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Suspended" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/payment/{idOrOrderId}:
+    get:
+      tags: [payments]
+      summary: Get payment by id or merchant order_id
+      description: >
+        Lookup order: invoice by id → invoice by order_id → draft by id →
+        draft by order_id. With duplicate order_ids an arbitrary matching row
+        is returned — keep order_ids unique. Cross-tenant ids return 404.
+      operationId: getPayment
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - { name: idOrOrderId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: >
+            Payment object. For unresolved pay_currency="all" drafts the
+            currency fields are null and `accepted_currencies` is present.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NpPayment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Not found (PAYMENT_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NpError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/x402/discovery:
+    get:
+      tags: [x402]
+      summary: x402 discovery catalog (public)
+      operationId: getX402Discovery
+      responses:
+        "200":
+          description: Monetized endpoint catalog
+          headers:
+            Cache-Control: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [x402Version, items]
+                properties:
+                  x402Version: { type: number }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [resource, type, x402Version, accepts, lastUpdated, metadata]
+                      properties:
+                        resource: { type: string, format: uri }
+                        type: { type: string, const: http }
+                        x402Version: { type: number }
+                        accepts: { type: array, items: { type: object } }
+                        lastUpdated: { type: number, description: Epoch seconds }
+                        metadata:
+                          type: object
+                          required: [title, description, method]
+                          properties:
+                            title: { type: string }
+                            description: { type: string }
+                            category: { type: [string, "null"] }
+                            method: { type: string }
+
+  # ───────────────────────── UTXO mass payouts ─────────────────────────
+  /v1/mass-payout:
+    post:
+      tags: [mass-payout-utxo]
+      summary: Create UTXO mass-payout order
+      operationId: createMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string }
+          description: Reuse of (merchant, key) returns 409 idempotency_conflict (no replay).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [chain, mode, csv]
+              properties:
+                chain: { type: string, enum: [bitcoin, litecoin, dogecoin] }
+                mode: { type: string, enum: [mainnet, testnet] }
+                csv: { type: string, format: binary, description: "Columns: address, amount (decimal string in whole coins), optional label" }
+      responses:
+        "201":
+          description: Order created (status pending_quote)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order]
+                properties:
+                  ok: { type: boolean, const: true }
+                  order: { $ref: "#/components/schemas/UtxoOrder" }
+        "400": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "422": { $ref: "#/components/responses/PayoutError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    get:
+      tags: [mass-payout-utxo]
+      summary: List UTXO mass-payout orders
+      operationId: listMassPayouts
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1, minimum: 1 }, description: One-based (unlike /v1/payment). }
+        - { name: limit, in: query, schema: { type: integer, default: 50, minimum: 1, maximum: 200 } }
+        - { name: status, in: query, schema: { type: string }, description: Invalid values silently ignored. }
+        - { name: chain, in: query, schema: { type: string }, description: Invalid values silently ignored. }
+      responses:
+        "200":
+          description: Orders page (batches always empty here; no total count)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, orders, page, limit]
+                properties:
+                  ok: { type: boolean, const: true }
+                  orders: { type: array, items: { $ref: "#/components/schemas/UtxoOrder" } }
+                  page: { type: integer }
+                  limit: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/mass-payout/{id}:
+    get:
+      tags: [mass-payout-utxo]
+      summary: Get UTXO mass-payout order (batches nested inside order)
+      operationId: getMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order]
+                properties:
+                  ok: { type: boolean, const: true }
+                  order: { $ref: "#/components/schemas/UtxoOrder" }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/mass-payout/{id}/confirm:
+    post:
+      tags: [mass-payout-utxo]
+      summary: Confirm order (pending_quote → pending_deposit); idempotent
+      operationId: confirmMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { $ref: "#/components/responses/UtxoOrderOk" }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/mass-payout/{id}/cancel:
+    post:
+      tags: [mass-payout-utxo]
+      summary: Cancel order; idempotent
+      operationId: cancelMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { $ref: "#/components/responses/UtxoOrderOk" }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/mass-payout/{id}/refresh-quote:
+    post:
+      tags: [mass-payout-utxo]
+      summary: Refresh fee quote (only pending_quote/pending_deposit, no deposit yet)
+      operationId: refreshMassPayoutQuote
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { $ref: "#/components/responses/UtxoOrderOk" }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/mass-payout/{id}/recipients:
+    get:
+      tags: [mass-payout-utxo]
+      summary: List recipients
+      operationId: getMassPayoutRecipients
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+        - { name: batchIndex, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: Recipients page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, items, page, limit]
+                properties:
+                  ok: { type: boolean, const: true }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [rowIndex, address, amountRaw, amountDecimal, label]
+                      properties:
+                        rowIndex: { type: integer }
+                        address: { type: string }
+                        amountRaw: { type: string, description: Integer string, smallest unit }
+                        amountDecimal: { type: string }
+                        label: { type: [string, "null"] }
+                  page: { type: integer }
+                  limit: { type: integer }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/mass-payout/{id}/report.csv:
+    get:
+      tags: [mass-payout-utxo]
+      summary: Download settlement report CSV (available after completion)
+      operationId: getMassPayoutReport
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: CSV stream
+          content:
+            text/csv: { schema: { type: string } }
+        "404":
+          description: Unknown order, report not built yet, or archive miss (indistinguishable)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutErrorBody" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/mass-payout/{id}/retry-failed:
+    post:
+      tags: [operator]
+      summary: Re-enqueue failed batches (OPERATOR ONLY — X-Operator-Key)
+      operationId: retryMassPayoutFailed
+      security: [{ operatorKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Retried or noop
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean, const: true }
+                  outcome: { type: string }
+                  batchesRequeued: { type: integer }
+        "401": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+
+  # ───────────────────────── EVM mass payouts ─────────────────────────
+  /v1/evm-mass-payout:
+    post:
+      tags: [mass-payout-evm]
+      summary: Create EVM mass-payout order
+      operationId: createEvmMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, maxLength: 128 }
+          description: Reuse of (merchant, key) returns 409 idempotency_conflict.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [chain, mode, tokenContract, csv]
+              properties:
+                chain: { type: string, enum: [polygon, arbitrum, optimism, base, bnb, avalanche] }
+                mode: { type: string, enum: [mainnet, testnet] }
+                tokenContract: { type: string, description: "0x… ERC-20 address" }
+                tokenSymbol: { type: string, default: USDC }
+                tokenDecimals: { type: string, default: "6" }
+                csv: { type: string, format: binary, description: "address, amount (decimal string in whole token units), optional label" }
+      responses:
+        "201":
+          description: Order created (quote TTL 15 min)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order]
+                properties:
+                  ok: { type: boolean, const: true }
+                  order:
+                    type: object
+                    required: [id, status, quote, expiresAt]
+                    properties:
+                      id: { type: string }
+                      merchantId: { type: string }
+                      chain: { type: string }
+                      mode: { type: string }
+                      tokenContract: { type: string }
+                      contractAddress: { type: string }
+                      status: { type: string, const: pending_quote }
+                      totalRecipients: { type: integer }
+                      totalBatches: { type: integer }
+                      quote:
+                        type: object
+                        required: [sumRecipientsRaw, payzumFeeRaw, totalToDepositRaw, feeBps, gasEstimateUsd]
+                        properties:
+                          sumRecipientsRaw: { type: string }
+                          payzumFeeRaw: { type: string }
+                          totalToDepositRaw: { type: string }
+                          feeBps: { type: number }
+                          gasEstimateUsd: { type: number }
+                      expiresAt: { type: number }
+                      createdAt: { type: number }
+        "400": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    get:
+      tags: [mass-payout-evm]
+      summary: List EVM mass-payout orders
+      operationId: listEvmMassPayouts
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: chain, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Orders page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, orders, page, limit]
+                properties:
+                  ok: { type: boolean, const: true }
+                  orders: { type: array, items: { $ref: "#/components/schemas/EvmOrder" } }
+                  page: { type: integer }
+                  limit: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/evm-mass-payout/{id}:
+    get:
+      tags: [mass-payout-evm]
+      summary: Get EVM order (order and batches are SIBLINGS, unlike UTXO)
+      operationId: getEvmMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Order + batches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order, batches]
+                properties:
+                  ok: { type: boolean, const: true }
+                  order: { $ref: "#/components/schemas/EvmOrder" }
+                  batches: { type: array, items: { $ref: "#/components/schemas/EvmBatch" } }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/evm-mass-payout/{id}/recipients:
+    get:
+      tags: [mass-payout-evm]
+      summary: List EVM recipients
+      operationId: getEvmRecipients
+      security: [{ merchantApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+        - { name: batchIndex, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: Recipients page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, items, page, limit]
+                properties:
+                  ok: { type: boolean, const: true }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [rowIndex, address, amountRaw, amountDecimal, status]
+                      properties:
+                        orderId: { type: string }
+                        rowIndex: { type: integer }
+                        address: { type: string }
+                        amountRaw: { type: string }
+                        amountDecimal: { type: string }
+                        label: { type: [string, "null"] }
+                        status: { type: string }
+                        txHash: { type: [string, "null"] }
+                        batchIndex: { type: [integer, "null"] }
+                  page: { type: integer }
+                  limit: { type: integer }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/evm-mass-payout/{id}/deposit-instructions:
+    get:
+      tags: [mass-payout-evm]
+      summary: Pre-built approve + deposit calldata
+      operationId: getEvmDepositInstructions
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Instructions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, instructions]
+                properties:
+                  ok: { type: boolean, const: true }
+                  instructions:
+                    type: object
+                    required: [approve, deposit, totalToDepositRaw, payoutRoot, chain, mode]
+                    properties:
+                      approve: { $ref: "#/components/schemas/EvmTxRequest" }
+                      deposit: { $ref: "#/components/schemas/EvmTxRequest" }
+                      totalToDepositRaw: { type: string }
+                      payoutRoot: { type: string }
+                      chain: { type: string }
+                      mode: { type: string }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/evm-mass-payout/{id}/confirm:
+    post:
+      tags: [mass-payout-evm]
+      summary: Confirm EVM order; idempotent
+      operationId: confirmEvmMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Order + batches
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order, batches]
+                properties:
+                  ok: { type: boolean, const: true }
+                  order: { $ref: "#/components/schemas/EvmOrder" }
+                  batches: { type: array, items: { $ref: "#/components/schemas/EvmBatch" } }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/evm-mass-payout/{id}/cancel:
+    post:
+      tags: [mass-payout-evm]
+      summary: Cancel EVM order; idempotent
+      operationId: cancelEvmMassPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Order + batches
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  order: { $ref: "#/components/schemas/EvmOrder" }
+                  batches: { type: array, items: { $ref: "#/components/schemas/EvmBatch" } }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/evm-mass-payout/{id}/refresh-quote:
+    post:
+      tags: [mass-payout-evm]
+      summary: Refresh EVM quote (15-min TTL)
+      operationId: refreshEvmQuote
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Refreshed order + quote
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order, quote]
+                properties:
+                  ok: { type: boolean, const: true }
+                  order: { $ref: "#/components/schemas/EvmOrder" }
+                  quote:
+                    type: object
+                    properties:
+                      sumRecipientsRaw: { type: string }
+                      payzumFeeRaw: { type: string }
+                      totalToDepositRaw: { type: string }
+                      feeBps: { type: number }
+                      gasEstimateUsd: { type: number }
+                      expiresAt: { type: number }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+        "500": { $ref: "#/components/responses/PayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/evm-mass-payout/{id}/refund:
+    post:
+      tags: [operator]
+      summary: Emergency refund (OPERATOR ONLY — X-Operator-Key)
+      operationId: refundEvmMassPayout
+      security: [{ operatorKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Refund broadcast (or already refunded)
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/PayoutError" }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+
+  /v1/evm-mass-payout/{id}/retry-failed:
+    post:
+      tags: [operator]
+      summary: Retry failed EVM batches (OPERATOR ONLY — X-Operator-Key)
+      operationId: retryEvmFailed
+      security: [{ operatorKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Retried
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/PayoutError" }
+        "404": { $ref: "#/components/responses/PayoutError" }
+        "409": { $ref: "#/components/responses/PayoutError" }
+
+  # ───────────────────────── Non-custodial payouts ─────────────────────────
+  /v1/nc-payout:
+    post:
+      tags: [nc-payout]
+      summary: Create non-custodial payout (returns EIP-712 typed data to sign)
+      operationId: createNcPayout
+      security: [{ merchantApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [chain, mode, tokenContract, funder, tokenDecimals, csv]
+              properties:
+                chain: { type: string, enum: [polygon, arbitrum, optimism, base, bnb, avalanche] }
+                mode: { type: string, enum: [mainnet, testnet] }
+                tokenContract: { type: string, pattern: "^0x[a-fA-F0-9]{40}$" }
+                funder: { type: string, pattern: "^0x[a-fA-F0-9]{40}$" }
+                tokenDecimals: { type: integer, minimum: 0, maximum: 36 }
+                tokenSymbol: { type: string, default: USDC }
+                csv: { type: string, format: binary }
+      responses:
+        "201":
+          description: Order awaiting signature
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order, signing]
+                properties:
+                  ok: { type: boolean, const: true }
+                  order: { type: object }
+                  signing: { type: object, description: "root/salt/deadline (bigint strings), payoutCommitTypedData, permitTypedData|null, approve fields" }
+        "400": { $ref: "#/components/responses/NcPayoutError" }
+        "403": { $ref: "#/components/responses/NcPayoutError" }
+        "503": { $ref: "#/components/responses/NcPayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/nc-payout/{id}:
+    get:
+      tags: [nc-payout]
+      summary: Get non-custodial payout order
+      operationId: getNcPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Order with progress
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NcPayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/nc-payout/{id}/submit:
+    post:
+      tags: [nc-payout]
+      summary: Submit EIP-712 signatures
+      operationId: submitNcPayout
+      security: [{ merchantApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [commitSig]
+              properties:
+                commitSig: { $ref: "#/components/schemas/EcdsaSig" }
+                permitSig:
+                  oneOf: [{ $ref: "#/components/schemas/EcdsaSig" }, { type: "null" }]
+      responses:
+        "200":
+          description: Accepted for distribution
+          content:
+            application/json:
+              schema: { type: object }
+        "400": { $ref: "#/components/responses/NcPayoutError" }
+        "404": { $ref: "#/components/responses/NcPayoutError" }
+        "409": { $ref: "#/components/responses/NcPayoutError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  # ───────────────────────── Export ─────────────────────────
+  /v1/export/accounting:
+    get:
+      tags: [export]
+      summary: Accounting export (CSV or JSON)
+      description: >
+        Auth: merchant x-api-key, OR operator X-Operator-Key + X-Merchant-Id.
+        Range max 366 days, `to` inclusive.
+      operationId: exportAccounting
+      security: [{ merchantApiKey: [] }, { operatorKey: [] }]
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, pattern: "^\\d{4}-\\d{2}-\\d{2}$" } }
+        - { name: to, in: query, required: true, schema: { type: string, pattern: "^\\d{4}-\\d{2}-\\d{2}$" } }
+        - { name: format, in: query, schema: { type: string, enum: [csv, json], default: csv } }
+        - { name: type, in: query, schema: { type: string, default: all, enum: [all, sales, conversions, fees, payouts, sale, conversion, fee, payout, mass_payout] } }
+      responses:
+        "200":
+          description: Export (snake_case lines; monetary values are decimal strings)
+          content:
+            text/csv: { schema: { type: string } }
+            application/json:
+              schema:
+                type: object
+                required: [meta, lines]
+                properties:
+                  meta: { type: object }
+                  lines: { type: array, items: { type: object } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503":
+          description: Cold archive unavailable (EXPORT_HISTORY_UNAVAILABLE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NpError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/export/reports:
+    get:
+      tags: [export]
+      summary: List frozen monthly reports
+      operationId: listReports
+      security: [{ merchantApiKey: [] }, { operatorKey: [] }]
+      responses:
+        "200":
+          description: Available months (note — no `ok` wrapper on this one)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reports]
+                properties:
+                  reports:
+                    type: array
+                    items:
+                      type: object
+                      required: [month, files]
+                      properties:
+                        month: { type: string, pattern: "^\\d{4}-\\d{2}$" }
+                        files: { type: array, items: { type: string, enum: [statement, summary] } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/export/reports/{month}:
+    get:
+      tags: [export]
+      summary: Download a frozen monthly report
+      operationId: downloadReport
+      security: [{ merchantApiKey: [] }, { operatorKey: [] }]
+      parameters:
+        - { name: month, in: path, required: true, schema: { type: string, pattern: "^\\d{4}-\\d{2}$" } }
+        - { name: file, in: query, schema: { type: string, enum: [statement, summary], default: statement } }
+      responses:
+        "200":
+          description: statement=CSV, summary=JSON
+          content:
+            text/csv: { schema: { type: string } }
+            application/json: { schema: { type: object } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404":
+          description: REPORT_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NpError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    merchantApiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: 64-char hex merchant key (values shorter than 32 chars are rejected as malformed).
+    operatorKey:
+      type: apiKey
+      in: header
+      name: X-Operator-Key
+      description: Internal operator secret. Not issued to merchants.
+
+  responses:
+    BadRequest:
+      description: INVALID_REQUEST / CURRENCY_NOT_SUPPORTED / AMOUNT_BELOW_MINIMUM / RANGE_TOO_LARGE
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NpError" }
+    Unauthorized:
+      description: API_KEY_MISSING / API_KEY_MALFORMED / API_KEY_NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NpError" }
+    Suspended:
+      description: MERCHANT_SUSPENDED
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NpError" }
+    RateLimited:
+      description: RATE_LIMIT_EXCEEDED (or QUOTA_EXCEEDED on create)
+      headers:
+        Retry-After: { schema: { type: string } }
+        X-RateLimit-Limit: { schema: { type: string, const: "60" } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NpError" }
+    Internal:
+      description: INTERNAL_ERROR
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NpError" }
+    RateProviderDown:
+      description: RATE_PROVIDER_DOWN
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NpError" }
+    PayoutError:
+      description: Payout result-envelope error ({ok:false, error:{kind, ...}})
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/PayoutErrorBody" }
+    NcPayoutError:
+      description: NC-payout error ({ok:false, error:{code, ...}})
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok, error]
+            properties:
+              ok: { type: boolean, const: false }
+              error:
+                type: object
+                required: [code]
+                properties:
+                  code: { type: string }
+    UtxoOrderOk:
+      description: "{ok:true, order}"
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok, order]
+            properties:
+              ok: { type: boolean, const: true }
+              order: { $ref: "#/components/schemas/UtxoOrder" }
+
+  schemas:
+    NpError:
+      type: object
+      description: Canonical error envelope. Branch on `code`, never on `message`.
+      required: [statusCode, code, message]
+      properties:
+        statusCode: { type: integer }
+        code:
+          type: string
+          enum: [API_KEY_MISSING, API_KEY_MALFORMED, API_KEY_NOT_FOUND,
+                 MERCHANT_SUSPENDED, RATE_LIMIT_EXCEEDED, INVALID_REQUEST,
+                 CURRENCY_NOT_SUPPORTED, RATE_PROVIDER_DOWN, QUOTA_EXCEEDED,
+                 PAYMENT_NOT_FOUND, INTERNAL_ERROR, AMOUNT_BELOW_MINIMUM,
+                 NO_ELIGIBLE_CURRENCIES, RANGE_TOO_LARGE,
+                 EXPORT_HISTORY_UNAVAILABLE, REPORT_NOT_FOUND]
+        message: { type: string }
+
+    PublicError:
+      type: object
+      description: >
+        Buyer-surface error: canonical envelope PLUS the legacy `error` slug
+        (invalid_invoice_id | rate_limited | not_found). Additive — clients
+        may branch on either.
+      required: [statusCode, code, message, error]
+      properties:
+        statusCode: { type: integer }
+        code: { type: string }
+        message: { type: string }
+        error: { type: string, enum: [invalid_invoice_id, rate_limited, not_found] }
+
+    NpPayment:
+      type: object
+      description: >
+        NowPayments-compatible payment object (also the IPN payload shape,
+        which additionally carries event_id + event_at). Monetary fields are
+        JSON numbers — frozen for compatibility; parse the raw JSON text with
+        a decimal type if you need exactness. For unresolved
+        pay_currency="all" drafts, currency fields are null and
+        accepted_currencies is present (GET only).
+      required: [payment_id, payment_status, price_amount, price_currency,
+                 purchase_id, created_at, updated_at]
+      properties:
+        payment_id: { type: string }
+        payment_status:
+          type: string
+          enum: [waiting, partially_paid, finished, expired, failed]
+          description: >
+            Only these 5 values are ever emitted. `overpaid` surfaces as
+            finished (compare actually_paid > pay_amount); `cancelled`
+            surfaces as failed. `unconfirmed` does not exist.
+        pay_address: { type: [string, "null"] }
+        price_amount: { type: number }
+        price_currency: { type: string, description: lowercase }
+        pay_amount: { type: [number, "null"], description: The QUOTED amount (what the buyer was asked to send). }
+        actually_paid: { type: number }
+        amount_received: { type: number }
+        pay_currency: { type: [string, "null"], description: NP code }
+        order_id: { type: [string, "null"] }
+        order_description: { type: [string, "null"] }
+        ipn_callback_url: { type: [string, "null"] }
+        purchase_id: { type: string, description: Always equals payment_id. }
+        smart_contract: { type: [string, "null"] }
+        network: { type: [string, "null"], description: "Internal chain name (ethereum, tron, bsc…)" }
+        network_precision: { type: [number, "null"] }
+        time_limit: { type: string, pattern: "^\\d{2,}:\\d{2}:\\d{2}$" }
+        expiration_estimate_date: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        burning_percent: { type: "null" }
+        payin_extra_id: { type: "null" }
+        invoice_url: { type: [string, "null"] }
+        invoice_type: { type: string, enum: [payment, donation, subscription, pos] }
+        subscriber_email: { type: [string, "null"] }
+        subscription_cycle: { type: [number, "null"] }
+        next_renewal_at: { type: [string, "null"] }
+        accepted_currencies:
+          type: array
+          description: Drafts only (GET /v1/payment/{id}).
+          items:
+            type: object
+            required: [currency, network, standard, estimated_amount, min_usd, token_id]
+            properties:
+              currency: { type: string }
+              network: { type: string }
+              standard: { type: string }
+              estimated_amount: { type: [number, "null"], description: Non-binding. }
+              min_usd: { type: number }
+              token_id: { type: string }
+
+    PayoutErrorBody:
+      type: object
+      required: [ok, error]
+      properties:
+        ok: { type: boolean, const: false }
+        error:
+          type: object
+          required: [kind]
+          properties:
+            kind: { type: string }
+          additionalProperties: true
+
+    UtxoOrder:
+      type: object
+      required: [id, status, chain, mode, depositAddress, quote]
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [pending_quote, pending_deposit, underfunded, funded, executing,
+                 completed, partial_failed, expired, cancelled, refunded]
+        chain: { type: string }
+        mode: { type: string }
+        depositAddress: { type: string }
+        expiresAt: { type: [number, "null"] }
+        totalRecipients: { type: integer }
+        totalBatches: { type: integer }
+        quote:
+          type: object
+          required: [sumRecipientsRaw, networkFeeRaw, payzumFeeRaw, totalToSendRaw, payzumFeeBps]
+          properties:
+            sumRecipientsRaw: { type: string }
+            networkFeeRaw: { type: string }
+            payzumFeeRaw: { type: string }
+            totalToSendRaw: { type: string }
+            payzumFeeBps: { type: number }
+            feeRateSatVbSnapshot: { type: number }
+        batches: { type: array, items: { type: object } }
+        fundedAt: { type: [number, "null"] }
+        receivedAmountRaw: { type: [string, "null"] }
+        depositTxids:
+          oneOf: [{ type: array, items: { type: string } }, { type: "null" }]
+        completedBatches: { type: integer }
+        failedBatches: { type: integer }
+        completedAt: { type: [number, "null"] }
+        cancelledAt: { type: [number, "null"] }
+        failureReason: { type: [string, "null"] }
+        createdAt: { type: [number, "null"] }
+
+    EvmOrder:
+      type: object
+      required: [id, status, chain, mode, tokenContract, contractAddress]
+      properties:
+        id: { type: string }
+        merchantId: { type: string }
+        chain: { type: string }
+        mode: { type: string }
+        tokenContract: { type: string }
+        tokenSymbol: { type: string }
+        tokenDecimals: { type: integer }
+        contractAddress: { type: string }
+        depositTxHash: { type: [string, "null"] }
+        status:
+          type: string
+          enum: [pending_quote, pending_deposit, deposit_pending, deposit_confirmed,
+                 executing, completed, partial_failed, expired, cancelled, refunded]
+        totalRecipients: { type: integer }
+        totalBatches: { type: integer }
+        completedBatches: { type: integer }
+        failedBatches: { type: integer }
+        sumRecipientsRaw: { type: string }
+        payzumFeeRaw: { type: string }
+        totalToDepositRaw: { type: string }
+        feeBps: { type: number }
+        distributionStartsAt: { type: [number, "null"] }
+        expiresAt: { type: number }
+        completedAt: { type: [number, "null"] }
+        cancelledAt: { type: [number, "null"] }
+        createdAt: { type: number }
+        updatedAt: { type: number }
+
+    EvmBatch:
+      type: object
+      required: [orderId, batchIndex, recipientCount, status]
+      properties:
+        orderId: { type: string }
+        batchIndex: { type: integer }
+        recipientCount: { type: integer }
+        sumRecipientsRaw: { type: string }
+        payzumFeeRaw: { type: string }
+        status: { type: string }
+        attemptCount: { type: integer }
+        txHash: { type: [string, "null"] }
+
+    EvmTxRequest:
+      type: object
+      required: [to, value, data]
+      properties:
+        to: { type: string }
+        value: { type: string }
+        data: { type: string }
+
+    EcdsaSig:
+      type: object
+      required: [v, r, s]
+      properties:
+        v: { type: integer }
+        r: { type: string, pattern: "^0x[0-9a-fA-F]{64}$" }
+        s: { type: string, pattern: "^0x[0-9a-fA-F]{64}$" }
